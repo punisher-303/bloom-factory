@@ -317,6 +317,31 @@ pub fn parse_search_results(data: &Value) -> (Vec<ParsedItem>, Option<String>) {
 
         // Look for continuation token
         continuation = find_continuation_token(data);
+    } else {
+        // Flat search results list (typically SearchFilter::All response)
+        let paths = [
+            "contents.tabbedSearchResultsRenderer.tabs.0.tabRenderer.content.sectionListRenderer.contents",
+            "contents.sectionListRenderer.contents",
+        ];
+        for path in &paths {
+            if let Some(sections) = nav(data, path).and_then(|v| v.as_array()) {
+                for section in sections {
+                    if let Some(item_sec) = section.get("itemSectionRenderer") {
+                        if let Some(inner_contents) = item_sec.get("contents").and_then(|c| c.as_array()) {
+                            for inner_item in inner_contents {
+                                if let Some(renderer) = inner_item.get("musicResponsiveListItemRenderer") {
+                                    if let Some(parsed) = parse_music_responsive_item(renderer) {
+                                        items.push(parsed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                continuation = find_continuation_token(data);
+                break;
+            }
+        }
     }
 
     // Also try musicCardShelfRenderer (top result)
@@ -2113,3 +2138,53 @@ pub fn parse_watch_playlist_continuation(
 
     (tracks, continuation)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_search_all() {
+        let json_str = include_str!("test_search_all.json");
+        let data: Value = serde_json::from_str(json_str).unwrap();
+        let (items, continuation) = parse_search_results(&data);
+        assert!(!items.is_empty(), "Parsed search results should not be empty!");
+        println!("Successfully parsed {} items!", items.len());
+        
+        let mut track_count = 0;
+        let mut album_count = 0;
+        let mut artist_count = 0;
+        let mut playlist_count = 0;
+
+        for (idx, item) in items.iter().enumerate() {
+            match item {
+                ParsedItem::Track { title, .. } => {
+                    track_count += 1;
+                    println!("Item {}: [Track] {}", idx, title);
+                }
+                ParsedItem::Album { title, .. } => {
+                    album_count += 1;
+                    println!("Item {}: [Album] {}", idx, title);
+                }
+                ParsedItem::Artist { name, .. } => {
+                    artist_count += 1;
+                    println!("Item {}: [Artist] {}", idx, name);
+                }
+                ParsedItem::Playlist { title, .. } => {
+                    playlist_count += 1;
+                    println!("Item {}: [Playlist] {}", idx, title);
+                }
+            }
+        }
+
+        println!("\nSummary:");
+        println!("  Tracks: {}", track_count);
+        println!("  Albums: {}", album_count);
+        println!("  Artists: {}", artist_count);
+        println!("  Playlists: {}", playlist_count);
+
+        assert!(track_count > 0, "Should parse at least one track!");
+        assert!(artist_count > 0, "Should parse at least one artist!");
+    }
+}
+

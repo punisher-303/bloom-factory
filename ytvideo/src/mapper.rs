@@ -456,12 +456,12 @@ fn thumbnail_to_artwork_opt(thumbnails: &[(String, u64)]) -> Option<Artwork> {
     Some(thumbnail_to_artwork(thumbnails))
 }
 
-/// Check if a URL is a YTM-specific square thumbnail (lh3.googleusercontent.com)
+/// Check if a URL is a YTM-specific square thumbnail (googleusercontent.com)
 /// as opposed to a standard 16:9 YouTube video thumbnail (i.ytimg.com).
 #[inline]
 fn is_ytm_thumbnail(url: &str) -> bool {
-    url.contains("lh3.googleusercontent.com")
-        || url.contains("yt3.ggpht.com")
+    url.contains("googleusercontent.com")
+        || url.contains("ggpht.com")
         || url.contains("music.youtube.com/ggpht")
 }
 
@@ -470,11 +470,14 @@ fn is_yt_video_thumbnail(url: &str) -> bool {
     url.contains("i.ytimg.com") || url.contains("img.youtube.com")
 }
 
-/// For lh3.googleusercontent.com thumbnails, generate a high-resolution version
+/// For googleusercontent.com thumbnails, generate a high-resolution version
 /// by replacing the `=wNNN-hNNN` suffix with a larger size.
 /// YTM returns small sizes (60px, 120px) but the server supports up to ~576px.
 fn ytm_high_res_url(url: &str, target_px: u32) -> String {
-    if !url.contains("lh3.googleusercontent.com") && !url.contains("yt3.ggpht.com") {
+    if !url.contains("googleusercontent.com")
+        && !url.contains("ggpht.com")
+        && !url.contains("music.youtube.com/ggpht")
+    {
         return url.to_string();
     }
     // URL suffix format: =w60-h60-l90-rj  or =w60-h60  or similar

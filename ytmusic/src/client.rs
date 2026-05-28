@@ -23,7 +23,7 @@ const API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 const CLIENT_NAME: &str = "WEB_REMIX";
 const CLIENT_VERSION: &str = "1.20260222.01.00";
 const USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0";
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36";
 
 // ANDROID_VR client — primary for ALL content (incl. YTM-exclusive).
 // Returns direct stream URLs with c=ANDROID_VR; CDN supports HEAD and large range requests.
@@ -35,6 +35,14 @@ const ANDROID_VR_CLIENT_VERSION: &str = "1.71.26";
 const ANDROID_VR_USER_AGENT: &str =
     "com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
 const ANDROID_VR_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+// IOS client — faster fallback than TVHTML5 because it usually returns direct URLs.
+// Numeric client ID = 5.
+const IOS_CLIENT_NAME: &str = "IOS";
+const IOS_CLIENT_ID: &str = "5";
+const IOS_CLIENT_VERSION: &str = "20.10.4";
+const IOS_USER_AGENT: &str = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)";
+const IOS_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 // TVHTML5 client — last-resort fallback, returns signatureCipher streams.
 const TV_CLIENT_NAME: &str = "TVHTML5";
@@ -115,7 +123,41 @@ fn ensure_visitor_data_seeded() {
         return;
     }
 
+    // Try sw.js_data first (lightweight & extremely robust, from youtube-explode)
     let options = utils::RequestOptions {
+        method: utils::HttpMethod::Get,
+        headers: Some(vec![
+            ("Accept".into(), "application/json".into()),
+            ("User-Agent".into(), "com.google.android.youtube/20.10.38 (Linux; U; ANDROID 11)".into()),
+        ]),
+        body: None,
+        timeout_seconds: Some(15),
+    };
+
+    if let Ok(resp) = utils::http_request("https://www.youtube.com/sw.js_data", &options) {
+        let mut text = String::from_utf8_lossy(&resp.body).into_owned();
+        if text.starts_with(")]}'") {
+            text = text[4..].trim().to_string();
+        }
+        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&text) {
+            let visitor_data = data
+                .get(0)
+                .and_then(|v| v.get(2))
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get(0))
+                .and_then(|v| v.get(13))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty());
+
+            if let Some(vd) = visitor_data {
+                cache_visitor_data(vd);
+                return;
+            }
+        }
+    }
+
+    // Fallback to legacy music.youtube.com fetch with lossy UTF-8 extraction
+    let fallback_options = utils::RequestOptions {
         method: utils::HttpMethod::Get,
         headers: Some(vec![
             ("User-Agent".into(), USER_AGENT.into()),
@@ -125,12 +167,8 @@ fn ensure_visitor_data_seeded() {
         timeout_seconds: Some(15),
     };
 
-    let resp = match utils::http_request("https://music.youtube.com/", &options) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-
-    if let Ok(html) = String::from_utf8(resp.body) {
+    if let Ok(resp) = utils::http_request("https://music.youtube.com/", &fallback_options) {
+        let html = String::from_utf8_lossy(&resp.body);
         if let Some(vd) = extract_visitor_data_from_html(&html) {
             cache_visitor_data(&vd);
         }
@@ -196,6 +234,12 @@ fn fetch_visitor_data(video_id: &str) -> Option<String> {
         return Some(cached);
     }
 
+    // Fast path: seed from sw.js_data or homepage first.
+    ensure_visitor_data_seeded();
+    if let Some(cached) = get_cached_visitor_data() {
+        return Some(cached);
+    }
+
     let url = format!("https://www.youtube.com/watch?v={video_id}");
     let options = utils::RequestOptions {
         method: utils::HttpMethod::Get,
@@ -207,7 +251,7 @@ fn fetch_visitor_data(video_id: &str) -> Option<String> {
         timeout_seconds: Some(15),
     };
     let resp = utils::http_request(&url, &options).ok()?;
-    let text = String::from_utf8(resp.body).ok()?;
+    let text = String::from_utf8_lossy(&resp.body);
 
     // Extract VISITOR_DATA or visitorData from the page
     let vd = extract_visitor_data_from_html(&text);
@@ -723,16 +767,19 @@ pub fn clear_cached_visitor_data() {
 }
 
 pub fn get_streams(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
-    // Fetch visitor data from the YouTube watch page.
-    // Required for ANDROID_VR client to avoid LOGIN_REQUIRED on YTM-exclusive tracks.
-    let visitor_data = fetch_visitor_data(video_id);
+    // Prefer cached/seeded visitorData first to avoid a slow watch-page fetch on cold start.
+    let mut visitor_data = get_cached_visitor_data();
+    if visitor_data.is_none() {
+        ensure_visitor_data_seeded();
+        visitor_data = get_cached_visitor_data();
+    }
 
     // --- Strategy 1: ANDROID_VR client ---
     match get_streams_android_vr(video_id, visitor_data.as_deref()) {
         Ok(streams) if !streams.is_empty() => {
             return Ok(streams);
         }
-        _ => {
+        Err(_) => {
             // ANDROID_VR failed, which strongly suggests our cached visitorData is stale/invalid.
             // Let's clear the cache, fetch fresh visitor data, and retry once.
             clear_cached_visitor_data();
@@ -744,9 +791,17 @@ pub fn get_streams(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
                 }
             }
         }
+        _ => {}
     }
 
-    // --- Strategy 2: TVHTML5 client (signatureCipher, last resort) ---
+    // --- Strategy 2: IOS client (usually direct URLs; faster than TV cipher path) ---
+    if let Ok(streams) = get_streams_ios(video_id, visitor_data.as_deref()) {
+        if !streams.is_empty() {
+            return Ok(streams);
+        }
+    }
+
+    // --- Strategy 3: TVHTML5 client (signatureCipher, last resort) ---
     get_streams_tv(video_id)
 }
 
@@ -826,10 +881,86 @@ fn get_streams_android_vr(
     Ok(streams)
 }
 
+/// IOS client player API call — usually returns direct audio URLs.
+///
+/// This is an effective middle-ground fallback before TV cipher decoding,
+/// especially for cold starts where TV manifest parsing is expensive.
+fn get_streams_ios(
+    video_id: &str,
+    visitor_data: Option<&str>,
+) -> Result<Vec<StreamSource>, anyhow::Error> {
+    let mut body = json!({
+        "context": {
+            "client": {
+                "clientName": IOS_CLIENT_NAME,
+                "clientVersion": IOS_CLIENT_VERSION,
+                "deviceModel": "iPhone16,2",
+                "userAgent": IOS_USER_AGENT,
+                "hl": "en",
+                "gl": "US",
+                "utcOffsetMinutes": 0
+            }
+        },
+        "videoId": video_id,
+        "playbackContext": {
+            "contentPlaybackContext": {
+                "html5Preference": "HTML5_PREF_WANTS"
+            }
+        },
+        "contentCheckOk": true,
+        "racyCheckOk": true
+    });
+
+    if let Some(vd) = visitor_data {
+        body["context"]["client"]["visitorData"] = json!(vd);
+    }
+
+    let mut extra_headers: Vec<(&str, &str)> = vec![
+        ("User-Agent", IOS_USER_AGENT),
+        ("X-YouTube-Client-Name", IOS_CLIENT_ID),
+        ("X-YouTube-Client-Version", IOS_CLIENT_VERSION),
+    ];
+    let vd_owned: String;
+    if let Some(vd) = visitor_data {
+        vd_owned = vd.to_string();
+        extra_headers.push(("X-Goog-Visitor-Id", &vd_owned));
+    }
+
+    let data = yt_post_to_url(IOS_API_URL, body, &extra_headers)?;
+
+    let status = data
+        .get("playabilityStatus")
+        .and_then(|p| p.get("status"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+
+    if status != "OK" {
+        let reason = data
+            .get("playabilityStatus")
+            .and_then(|p| p.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("Unknown");
+        return Err(anyhow::anyhow!(
+            "IOS client: status={status}, reason={reason}"
+        ));
+    }
+
+    let ios_headers = Some(vec![("User-Agent".to_string(), IOS_USER_AGENT.to_string())]);
+    let streams = collect_direct_streams_with_headers(&data, ios_headers);
+    Ok(streams)
+}
+
 /// Collect audio streams from a player API response that has direct `url` fields.
 ///
 /// ANDROID_VR CDN URLs work without any special headers (mpv/ffmpeg compatible).
 fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
+    collect_direct_streams_with_headers(data, None)
+}
+
+fn collect_direct_streams_with_headers(
+    data: &Value,
+    headers: Option<Vec<(String, String)>>,
+) -> Vec<StreamSource> {
     let mut formats = data
         .get("streamingData")
         .and_then(|s| s.get("adaptiveFormats"))
@@ -837,14 +968,13 @@ fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
         .cloned()
         .unwrap_or_default();
 
-    // Also pull from `formats` (muxed) in case adaptiveFormats is empty
-    if formats.is_empty() {
-        formats = data
-            .get("streamingData")
-            .and_then(|s| s.get("formats"))
-            .and_then(|f| f.as_array())
-            .cloned()
-            .unwrap_or_default();
+    // Also merge formats from `formats` (muxed streams)
+    if let Some(muxed) = data
+        .get("streamingData")
+        .and_then(|s| s.get("formats"))
+        .and_then(|f| f.as_array())
+    {
+        formats.extend(muxed.clone());
     }
 
     let mut streams: Vec<StreamSource> = formats
@@ -852,7 +982,7 @@ fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
         .filter(|f| {
             f.get("mimeType")
                 .and_then(|m| m.as_str())
-                .map(|m| m.starts_with("audio/"))
+                .map(|m| m.starts_with("audio/") || (m.starts_with("video/") && (m.contains("mp4a") || m.contains("opus"))))
                 .unwrap_or(false)
         })
         .filter_map(|f| {
@@ -867,7 +997,7 @@ fn collect_direct_streams(data: &Value) -> Vec<StreamSource> {
                 url.to_string(),
                 bitrate,
                 mime,
-                None, // No special headers needed for ANDROID_VR
+                headers.clone(),
             ))
         })
         .collect();
