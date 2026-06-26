@@ -2,16 +2,16 @@
 //!
 //! All API interactions go through this module.
 
+use crate::cipher;
+use crate::mapper;
+use crate::parser;
 use bex_core::resolver::component::content_resolver::utils;
 use bex_core::resolver::data_source::{
     AlbumDetails, ArtistDetails, PagedAlbums, PagedMediaItems, PagedTracks, PlaylistDetails,
     SearchFilter, StreamSource,
 };
 use bex_core::resolver::discovery::Section;
-use bex_core::resolver::types::{Artwork, ArtistSummary, ImageLayout, MediaItem, Track};
-use crate::cipher;
-use crate::mapper;
-use crate::parser;
+use bex_core::resolver::types::{ArtistSummary, Artwork, ImageLayout, MediaItem, Track};
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -41,7 +41,8 @@ const ANDROID_VR_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?pre
 const IOS_CLIENT_NAME: &str = "IOS";
 const IOS_CLIENT_ID: &str = "5";
 const IOS_CLIENT_VERSION: &str = "20.10.4";
-const IOS_USER_AGENT: &str = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)";
+const IOS_USER_AGENT: &str =
+    "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)";
 const IOS_API_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
 
 // TVHTML5 client — last-resort fallback, returns signatureCipher streams.
@@ -128,7 +129,10 @@ fn ensure_visitor_data_seeded() {
         method: utils::HttpMethod::Get,
         headers: Some(vec![
             ("Accept".into(), "application/json".into()),
-            ("User-Agent".into(), "com.google.android.youtube/20.10.38 (Linux; U; ANDROID 11)".into()),
+            (
+                "User-Agent".into(),
+                "com.google.android.youtube/20.10.38 (Linux; U; ANDROID 11)".into(),
+            ),
         ]),
         body: None,
         timeout_seconds: Some(15),
@@ -767,35 +771,55 @@ pub fn clear_cached_visitor_data() {
 }
 
 pub fn get_streams(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
-    // Prefer cached/seeded visitorData first to avoid a slow watch-page fetch on cold start.
+    // Get visitor data: prefer cached/seeded first for fast cold start, but always
+    // fall through to a fresh watch-page fetch so a stale token can never cause
+    // a permanent failure.
     let mut visitor_data = get_cached_visitor_data();
     if visitor_data.is_none() {
         ensure_visitor_data_seeded();
         visitor_data = get_cached_visitor_data();
+        if visitor_data.is_none() {
+            visitor_data = fetch_visitor_data(video_id);
+        }
     }
 
     // --- Strategy 1: ANDROID_VR client ---
+    let fresh_visitor_data: Option<String>;
     match get_streams_android_vr(video_id, visitor_data.as_deref()) {
         Ok(streams) if !streams.is_empty() => {
             return Ok(streams);
         }
-        Err(_) => {
-            // ANDROID_VR failed, which strongly suggests our cached visitorData is stale/invalid.
-            // Let's clear the cache, fetch fresh visitor data, and retry once.
+        Err(_) | Ok(_) => {
+            // ANDROID_VR failed (or returned no streams), which strongly suggests our
+            // cached/seeded visitorData is stale/invalid. Clear the cache, fetch fresh
+            // visitor data from the YouTube watch page, and retry once.
             clear_cached_visitor_data();
-            let fresh_visitor_data = fetch_visitor_data(video_id);
+            fresh_visitor_data = fetch_visitor_data(video_id);
 
-            if let Ok(streams) = get_streams_android_vr(video_id, fresh_visitor_data.as_deref()) {
-                if !streams.is_empty() {
-                    return Ok(streams);
+            if let Some(ref fresh) = fresh_visitor_data {
+                if let Ok(streams) = get_streams_android_vr(video_id, Some(fresh.as_str())) {
+                    if !streams.is_empty() {
+                        return Ok(streams);
+                    }
                 }
             }
+
+            // Promote the fresh visitor data so subsequent fallbacks (IOS) can use it.
+            if let Some(fresh) = fresh_visitor_data.clone() {
+                visitor_data = Some(fresh);
+            }
         }
-        _ => {}
     }
 
     // --- Strategy 2: IOS client (usually direct URLs; faster than TV cipher path) ---
-    if let Ok(streams) = get_streams_ios(video_id, visitor_data.as_deref()) {
+    // Always pass the freshest visitor data we have. If we never re-fetched
+    // (i.e. ANDROID_VR returned Ok with empty streams), do a fresh watch-page
+    // fetch now so IOS does not get stuck with the same stale token.
+    let ios_visitor_data: Option<String> = match fresh_visitor_data {
+        Some(fresh) => Some(fresh),
+        None => fetch_visitor_data(video_id).or(visitor_data),
+    };
+    if let Ok(streams) = get_streams_ios(video_id, ios_visitor_data.as_deref()) {
         if !streams.is_empty() {
             return Ok(streams);
         }
@@ -982,7 +1006,10 @@ fn collect_direct_streams_with_headers(
         .filter(|f| {
             f.get("mimeType")
                 .and_then(|m| m.as_str())
-                .map(|m| m.starts_with("audio/") || (m.starts_with("video/") && (m.contains("mp4a") || m.contains("opus"))))
+                .map(|m| {
+                    m.starts_with("audio/")
+                        || (m.starts_with("video/") && (m.contains("mp4a") || m.contains("opus")))
+                })
                 .unwrap_or(false)
         })
         .filter_map(|f| {
@@ -1142,9 +1169,7 @@ fn get_streams_tv(video_id: &str) -> Result<Vec<StreamSource>, anyhow::Error> {
     }
 }
 
-fn quality_rank(
-    q: &bex_core::resolver::data_source::Quality,
-) -> u8 {
+fn quality_rank(q: &bex_core::resolver::data_source::Quality) -> u8 {
     use bex_core::resolver::data_source::Quality;
     match q {
         Quality::Lossless => 3,
