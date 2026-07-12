@@ -365,11 +365,12 @@ fn extract_client_id_from_web() -> Option<String> {
 }
 
 fn token_from_client_credentials() -> Option<AccessToken> {
-    let client_id = extract_client_id_from_web()?;
-    let body = format!("grant_type=client_credentials&client_id={client_id}");
+    let auth = "Basic YThmZWM5OWZjMDVjNDZlMTllYjliMWVmMTkyYmU4ZjA6ZWRkYjNkZDM3OTIwNDY3ZTkwYjNhNjIzMzhiNjI3MTQ=";
+    let body = String::from("grant_type=client_credentials");
     let resp = http::post("https://accounts.spotify.com/api/token")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
+        .header("Authorization", auth)
         .body(body.into_bytes())
         .timeout(20)
         .send()
